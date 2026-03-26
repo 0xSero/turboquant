@@ -271,63 +271,49 @@ class PatchedFlashForward:
         output_scale=None,
         output_block_scale=None,
     ):
+        # Fast path: when paged cache exists and not in accumulate-only mode,
+        # the only extra work is capturing K/V during prefill. For decode
+        # (the hot path), we fall through to flash attention immediately.
+        if not self.no_alloc:
+            mode = _GLOBAL_MODE
+            if mode != MODE_ACCUMULATE and attn_metadata is not None:
+                is_prefill = attn_metadata.max_query_len > 1
+                if is_prefill and mode == MODE_ACTIVE:
+                    # Prefill: capture K/V into TQ, but still use flash attention
+                    pass  # capture already happens in do_kv_cache_update
+            return self.orig_fn(
+                self_impl, layer, query, key, value, kv_cache,
+                attn_metadata, output, output_scale, output_block_scale,
+            )
+
+        # no_alloc path below -- paged cache was freed
         mode = _GLOBAL_MODE
 
         if mode == MODE_ACCUMULATE:
             return self.orig_fn(
-                self_impl,
-                layer,
-                query,
-                key,
-                value,
-                kv_cache,
-                attn_metadata,
-                output,
-                output_scale,
-                output_block_scale,
+                self_impl, layer, query, key, value, kv_cache,
+                attn_metadata, output, output_scale, output_block_scale,
             )
 
-        is_prefill = attn_metadata is not None and attn_metadata.max_query_len > 1
-
-        # Profiling pass (attn_metadata is None) -- must use original flash
         if attn_metadata is None:
             return self.orig_fn(
                 self_impl, layer, query, key, value, kv_cache,
                 attn_metadata, output, output_scale, output_block_scale,
             )
 
-        # --- PREFILL ---
+        is_prefill = attn_metadata.max_query_len > 1
+
+        # --- PREFILL (no_alloc only) ---
         if is_prefill:
-            if self.no_alloc:
-                # No paged cache exists. Compute attention ourselves and
-                # capture K/V into TQ compressed store.
-                result = _tq_prefill_attention(
-                    self.state, self_impl, query, key, value, attn_metadata
-                )
-                if output is not None:
-                    output[:result.shape[0]].copy_(result.view_as(output[:result.shape[0]]))
-                    return output
-                return result
-            else:
-                # Paged cache exists, use flash attention normally
-                return self.orig_fn(
-                    self_impl, layer, query, key, value, kv_cache,
-                    attn_metadata, output, output_scale, output_block_scale,
-                )
-
-        # --- DECODE ---
-        # When paged KV cache exists, always use flash attention for decode.
-        # Flash attention reads from the complete paged cache (prefill + all
-        # decode tokens) and is faster than the TQ Triton kernel path.
-        # The TQ compressed store is only used for decode when no_alloc=True
-        # (i.e. the paged cache has been freed to save VRAM).
-        if not self.no_alloc:
-            return self.orig_fn(
-                self_impl, layer, query, key, value, kv_cache,
-                attn_metadata, output, output_scale, output_block_scale,
+            result = _tq_prefill_attention(
+                self.state, self_impl, query, key, value, attn_metadata
             )
+            if output is not None:
+                output[:result.shape[0]].copy_(result.view_as(output[:result.shape[0]]))
+                return output
+            return result
 
-        # no_alloc path: paged cache was freed, must use TQ decode
+        # --- DECODE (no_alloc only): paged cache was freed, must use TQ decode ---
         cache = self.state.seq_caches.get("default")
         flat = self.state.get_flat_cache(cache) if cache is not None else None
         has_tq_data = flat is not None and flat[2] >= 16
@@ -624,21 +610,13 @@ def install_turboquant_hooks(
         if backend_kind == "flash":
             patched_update = PatchedFlashKVCacheUpdate(impl.do_kv_cache_update.__func__, state, no_alloc=no_alloc)  # noqa: E501
             patched_forward = PatchedFlashForward(impl.forward.__func__, state, no_alloc=no_alloc)
-            impl.do_kv_cache_update = types.MethodType(
-                lambda self, *a, _p=patched_update, **k: _p(self, *a, **k), impl
-            )
-            impl.forward = types.MethodType(
-                lambda self, *a, _p=patched_forward, **k: _p(self, *a, **k), impl
-            )
+            impl.do_kv_cache_update = types.MethodType(patched_update, impl)
+            impl.forward = types.MethodType(patched_forward, impl)
         else:
             patched_update = PatchedMLAKVCacheUpdate(impl.do_kv_cache_update.__func__, state)
             patched_forward_mqa = PatchedMLAForwardMQA(impl.forward_mqa.__func__, state)
-            impl.do_kv_cache_update = types.MethodType(
-                lambda self, *a, _p=patched_update, **k: _p(self, *a, **k), impl
-            )
-            impl.forward_mqa = types.MethodType(
-                lambda self, *a, _p=patched_forward_mqa, **k: _p(self, *a, **k), impl
-            )
+            impl.do_kv_cache_update = types.MethodType(patched_update, impl)
+            impl.forward_mqa = types.MethodType(patched_forward_mqa, impl)
 
         impl._tq_state = state
         layer_idx += 1
