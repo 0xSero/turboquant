@@ -695,13 +695,11 @@ def capture_kv_cache(model_runner, num_tokens: int = 0):
     Read K/V data from vLLM's paged KV cache and compress into TQ format.
 
     Call this AFTER generation (prefill + decode) but BEFORE free_kv_cache().
-    The paged cache contains all tokens (prefill + decoded). We read them out
-    and compress into TQ's quantized store for each layer.
+    Processes one layer at a time to minimize peak memory.
 
     Args:
         model_runner: the vLLM model runner
-        num_tokens: number of tokens in the KV cache to capture.
-                    If 0, captures all blocks that appear allocated.
+        num_tokens: number of tokens to capture. If 0, uses all allocated blocks.
     Returns: number of tokens captured per layer.
     """
     tq_states = getattr(model_runner, "_tq_states", None)
@@ -723,25 +721,24 @@ def capture_kv_cache(model_runner, num_tokens: int = 0):
             continue
 
         # kv_tensor shape: (2, num_blocks, block_size, num_kv_heads, head_size)
-        keys_paged = kv_tensor[0]    # (num_blocks, block_size, num_kv_heads, head_size)
-        values_paged = kv_tensor[1]  # (num_blocks, block_size, num_kv_heads, head_size)
-
-        num_blocks, block_size, num_kv_heads, head_size = keys_paged.shape
+        num_blocks, block_size, num_kv_heads, head_size = kv_tensor[0].shape
 
         if num_tokens > 0:
-            n_blocks_used = (num_tokens + block_size - 1) // block_size
-            total_tokens = num_tokens
+            n_blocks_used = min((num_tokens + block_size - 1) // block_size, num_blocks)
+            total_tokens = min(num_tokens, n_blocks_used * block_size)
         else:
             n_blocks_used = num_blocks
             total_tokens = num_blocks * block_size
 
-        # Flatten: (used_blocks, block_size, kv_heads, dim) -> (kv_heads, total_tok, dim)
-        k_flat = keys_paged[:n_blocks_used].reshape(-1, num_kv_heads, head_size)[:total_tokens]
-        v_flat = values_paged[:n_blocks_used].reshape(-1, num_kv_heads, head_size)[:total_tokens]
+        # Read keys and values from paged cache -- reshape in-place, no copy
+        # (num_blocks, block_size, kv_heads, dim) -> (total_tok, kv_heads, dim)
+        k_flat = kv_tensor[0, :n_blocks_used].reshape(-1, num_kv_heads, head_size)[:total_tokens]
+        v_flat = kv_tensor[1, :n_blocks_used].reshape(-1, num_kv_heads, head_size)[:total_tokens]
 
-        # Reshape to (1, kv_heads, total_tok, dim) for TQ cache API
-        k_for_tq = k_flat.permute(1, 0, 2).unsqueeze(0).to(torch.bfloat16)
-        v_for_tq = v_flat.permute(1, 0, 2).unsqueeze(0).to(torch.bfloat16)
+        # TQ cache API expects (1, kv_heads, seq_len, dim)
+        # Use contiguous views to avoid large allocations
+        k_for_tq = k_flat.permute(1, 0, 2).unsqueeze(0)  # (1, kv_heads, tok, dim)
+        v_for_tq = v_flat.permute(1, 0, 2).unsqueeze(0)
 
         # Reset any existing TQ cache and compress
         state.seq_caches.clear()
@@ -751,6 +748,10 @@ def capture_kv_cache(model_runner, num_tokens: int = 0):
         cache = state.get_or_create_cache("default")
         cache.prefill(k_for_tq, v_for_tq)
         captured = total_tokens
+
+        # Free intermediate refs immediately
+        del k_flat, v_flat, k_for_tq, v_for_tq
+        torch.cuda.empty_cache()
 
     logger.info(f"[TurboQuant] Captured {captured} tokens from paged KV cache into TQ ({len(tq_states)} layers)")
     return captured
