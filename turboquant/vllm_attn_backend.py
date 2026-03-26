@@ -206,22 +206,23 @@ class TurboQuantLayerState:
 
 
 class PatchedFlashKVCacheUpdate:
-    """Intercepts do_kv_cache_update to accumulate KV into TurboQuant side-cache.
+    """Intercepts do_kv_cache_update.
 
-    CRITICAL PERFORMANCE NOTE:
-    In enforce_eager mode, this hook is called on EVERY token including decode.
-    We MUST skip single-token decode calls (num_tokens==1) to avoid O(n^2)
-    torch.cat growth on the quantized cache. Only prefill batches (num_tokens>1)
-    are worth quantizing here. Decode tokens are already handled by vLLM's
-    paged cache and the TQ forward hook reads from the quantized prefill data.
+    In NO_ALLOC mode: skip writing to paged cache entirely (it doesn't exist).
+    K/V capture happens in PatchedFlashForward instead.
+    In other modes: write to paged cache normally, then capture for TQ.
     """
-    __slots__ = ("orig_fn", "state")
+    __slots__ = ("orig_fn", "state", "no_alloc")
 
-    def __init__(self, orig_fn, state: TurboQuantLayerState):
+    def __init__(self, orig_fn, state: TurboQuantLayerState, no_alloc: bool = False):
         self.orig_fn = orig_fn
         self.state = state
+        self.no_alloc = no_alloc
 
     def __call__(self, self_impl, layer, key, value, kv_cache, slot_mapping):
+        if self.no_alloc:
+            return
+
         self.orig_fn(self_impl, layer, key, value, kv_cache, slot_mapping)
 
         num_tokens = slot_mapping.shape[0]
@@ -250,11 +251,12 @@ class PatchedMLAKVCacheUpdate:
 
 
 class PatchedFlashForward:
-    __slots__ = ("orig_fn", "state")
+    __slots__ = ("orig_fn", "state", "no_alloc")
 
-    def __init__(self, orig_fn, state: TurboQuantLayerState):
+    def __init__(self, orig_fn, state: TurboQuantLayerState, no_alloc: bool = False):
         self.orig_fn = orig_fn
         self.state = state
+        self.no_alloc = no_alloc
 
     def __call__(
         self,
@@ -285,34 +287,45 @@ class PatchedFlashForward:
                 output_block_scale,
             )
 
-        if attn_metadata is None or attn_metadata.max_query_len > 1:
+        is_prefill = attn_metadata is not None and attn_metadata.max_query_len > 1
+
+        # Profiling pass (attn_metadata is None) -- must use original flash
+        if attn_metadata is None:
             return self.orig_fn(
-                self_impl,
-                layer,
-                query,
-                key,
-                value,
-                kv_cache,
-                attn_metadata,
-                output,
-                output_scale,
-                output_block_scale,
+                self_impl, layer, query, key, value, kv_cache,
+                attn_metadata, output, output_scale, output_block_scale,
             )
 
+        # --- PREFILL ---
+        if is_prefill:
+            if self.no_alloc:
+                # No paged cache exists. Compute attention ourselves and
+                # capture K/V into TQ compressed store.
+                result = _tq_prefill_attention(
+                    self.state, self_impl, query, key, value, attn_metadata
+                )
+                if output is not None:
+                    output[:result.shape[0]].copy_(result.view_as(output[:result.shape[0]]))
+                    return output
+                return result
+            else:
+                # Paged cache exists, use flash attention normally
+                return self.orig_fn(
+                    self_impl, layer, query, key, value, kv_cache,
+                    attn_metadata, output, output_scale, output_block_scale,
+                )
+
+        # --- DECODE ---
         cache = self.state.seq_caches.get("default")
         flat = self.state.get_flat_cache(cache) if cache is not None else None
         has_tq_data = flat is not None and flat[2] >= 16
 
-        # In ACTIVE mode with TQ data, try to skip flash attention entirely.
-        # This is the key to VRAM savings: we don't need the paged cache for
-        # old tokens, only the TQ compressed store.
         if mode == MODE_ACTIVE and has_tq_data:
             decode_batch = _build_flash_decode_batch(self.state, query, attn_metadata, cache)
             if decode_batch is not None:
                 tq_out = _run_flash_turboquant_decode(self.state, self_impl, decode_batch)
                 if tq_out is not None:
                     num_actual = attn_metadata.num_actual_tokens
-                    # Reshape to match expected output: (num_actual_tokens, num_query_heads * head_dim)
                     expected_shape = (num_actual, decode_batch.num_query_heads * decode_batch.head_dim)
                     result = tq_out.reshape(expected_shape).to(query.dtype)
 
@@ -330,52 +343,25 @@ class PatchedFlashForward:
                         return output
                     return result
 
-        # Fallback: no TQ data, or TQ failed -- run flash attention
-        if not has_tq_data:
-            return self.orig_fn(
-                self_impl,
-                layer,
-                query,
-                key,
-                value,
-                kv_cache,
-                attn_metadata,
-                output,
-                output_scale,
-                output_block_scale,
+        # Fallback to flash attention (only works if paged cache was allocated)
+        if not self.no_alloc:
+            if not has_tq_data:
+                return self.orig_fn(
+                    self_impl, layer, query, key, value, kv_cache,
+                    attn_metadata, output, output_scale, output_block_scale,
+                )
+
+            # SHADOW mode
+            flash_out = self.orig_fn(
+                self_impl, layer, query, key, value, kv_cache,
+                attn_metadata, output, output_scale, output_block_scale,
             )
-
-        # SHADOW mode: run both flash and TQ, return flash output
-        flash_out = self.orig_fn(
-            self_impl,
-            layer,
-            query,
-            key,
-            value,
-            kv_cache,
-            attn_metadata,
-            output,
-            output_scale,
-            output_block_scale,
-        )
-
-        decode_batch = _build_flash_decode_batch(self.state, query, attn_metadata, cache)
-        if decode_batch is None:
             return flash_out
 
-        tq_out = _run_flash_turboquant_decode(self.state, self_impl, decode_batch)
-        if tq_out is None:
-            return flash_out
-
-        if self.state._log_count < 3 and self.state.layer_idx == 0:
-            logger.info(
-                f"[TQ {mode} L{self.state.layer_idx}] "
-                f"out={tuple(tq_out.shape)} q_heads={decode_batch.num_query_heads} "
-                f"kv_heads={self.state.num_kv_heads} TQ tokens={decode_batch.quantized_tokens}"
-            )
-            self.state._log_count += 1
-
-        return flash_out
+        # no_alloc decode without TQ data -- shouldn't happen after prefill
+        logger.warning(f"[TQ] no_alloc decode without TQ data on L{self.state.layer_idx}")
+        num_actual = attn_metadata.num_actual_tokens
+        return torch.zeros(num_actual, query.shape[-1], dtype=query.dtype, device=query.device)
 
 
 class PatchedMLAForwardMQA:
@@ -432,6 +418,65 @@ def _flatten_quantized_cache(prod_q: ProdQuantized, value_q: ValueQuantized) -> 
     flat_value_q = ValueQuantized(data=v_data, scales=v_scales, zeros=v_zeros, bits=v_bits)
     quantized_tokens = int(norms.shape[-1])
     return flat_prod_q, flat_value_q, quantized_tokens
+
+
+def _tq_prefill_attention(
+    state: TurboQuantLayerState,
+    self_impl,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_metadata,
+) -> torch.Tensor:
+    """Compute prefill attention without paged KV cache, capture K/V into TQ."""
+    import torch.nn.functional as F
+
+    num_actual = attn_metadata.num_actual_tokens
+    q = query[:num_actual]   # (N, num_q_heads, head_dim)
+    k = key[:num_actual]     # (N, num_kv_heads, head_dim)
+    v = value[:num_actual]   # (N, num_kv_heads, head_dim)
+
+    # Capture K/V into TQ compressed store
+    state.ring_write(k, v, num_actual)
+    state.flush_default_sequence()
+
+    head_dim = state.head_dim
+    num_kv_heads = state.num_kv_heads
+    num_q_heads = q.shape[1] if q.dim() == 3 else q.shape[-1] // head_dim
+
+    if q.dim() == 2:
+        q = q.view(num_actual, num_q_heads, head_dim)
+    if k.dim() == 2:
+        k = k.view(num_actual, num_kv_heads, head_dim)
+        v = v.view(num_actual, num_kv_heads, head_dim)
+
+    # GQA: repeat K/V heads to match Q heads
+    if num_q_heads != num_kv_heads:
+        repeats = num_q_heads // num_kv_heads
+        k = k.repeat_interleave(repeats, dim=1)
+        v = v.repeat_interleave(repeats, dim=1)
+
+    # (1, heads, seq, dim) for SDPA
+    q_t = q.unsqueeze(0).transpose(1, 2)
+    k_t = k.unsqueeze(0).transpose(1, 2)
+    v_t = v.unsqueeze(0).transpose(1, 2)
+
+    scale = getattr(self_impl, 'scale', 1.0 / (head_dim ** 0.5))
+    attn_out = F.scaled_dot_product_attention(
+        q_t, k_t, v_t, is_causal=True, scale=scale
+    )  # (1, heads, seq, dim)
+
+    # Back to (num_tokens, num_heads * head_dim) -- matches vLLM output format
+    result = attn_out.squeeze(0).transpose(0, 1).reshape(num_actual, num_q_heads * head_dim)
+
+    if state._log_count < 3 and state.layer_idx == 0:
+        logger.info(
+            f"[TQ PREFILL L{state.layer_idx}] tokens={num_actual} "
+            f"q_heads={num_q_heads} kv_heads={num_kv_heads} head_dim={head_dim}"
+        )
+        state._log_count += 1
+
+    return result.to(query.dtype)
 
 
 def _repeat_kv_heads_for_gqa(query_heads: torch.Tensor, num_kv_heads: int) -> torch.Tensor:
@@ -517,6 +562,7 @@ def install_turboquant_hooks(
     initial_layers_count: int = 4,
     initial_layers_key_bits: int | None = None,
     mode: str = MODE_ACCUMULATE,
+    no_alloc: bool = False,
 ):
     global _GLOBAL_MODE
     _GLOBAL_MODE = mode
@@ -565,8 +611,8 @@ def install_turboquant_hooks(
         tq_states[layer_name] = state
 
         if backend_kind == "flash":
-            patched_update = PatchedFlashKVCacheUpdate(impl.do_kv_cache_update.__func__, state)  # noqa: E501
-            patched_forward = PatchedFlashForward(impl.forward.__func__, state)
+            patched_update = PatchedFlashKVCacheUpdate(impl.do_kv_cache_update.__func__, state, no_alloc=no_alloc)  # noqa: E501
+            patched_forward = PatchedFlashForward(impl.forward.__func__, state, no_alloc=no_alloc)
             impl.do_kv_cache_update = types.MethodType(
                 lambda self, *a, _p=patched_update, **k: _p(self, *a, **k), impl
             )
@@ -587,5 +633,123 @@ def install_turboquant_hooks(
         layer_idx += 1
 
     model_runner._tq_states = tq_states
-    logger.info(f"[TurboQuant] Hooks on {len(tq_states)} layers (mode={mode})")
+    model_runner._tq_no_alloc = no_alloc
+    logger.info(f"[TurboQuant] Hooks on {len(tq_states)} layers (mode={mode}, no_alloc={no_alloc})")
     return tq_states
+
+
+_TQ_NO_ALLOC_CONFIG = None
+
+
+def enable_no_alloc(
+    key_bits: int = 3,
+    value_bits: int = 2,
+    buffer_size: int = 128,
+    initial_layers_count: int = 4,
+):
+    """
+    Call BEFORE creating vllm.LLM(). Patches the executor so that during
+    engine initialization, TQ hooks are installed on all workers automatically.
+
+    After prefill, call free_kv_cache() via collective_rpc to release the
+    paged KV cache for TQ layers -- TQ's compressed store holds all old tokens.
+    """
+    global _TQ_NO_ALLOC_CONFIG
+    _TQ_NO_ALLOC_CONFIG = dict(
+        key_bits=key_bits,
+        value_bits=value_bits,
+        buffer_size=buffer_size,
+        initial_layers_count=initial_layers_count,
+    )
+
+    from vllm.v1.executor.abstract import Executor
+
+    if hasattr(Executor, "_tq_patched"):
+        return
+
+    orig_get_specs = Executor.get_kv_cache_specs
+
+    def patched_get_kv_cache_specs(self):
+        cfg = _TQ_NO_ALLOC_CONFIG
+        if cfg is None:
+            return orig_get_specs(self)
+
+        def _worker_install_tq(worker):
+            from turboquant.vllm_attn_backend import (
+                install_turboquant_hooks, MODE_ACTIVE
+            )
+            tq_states = install_turboquant_hooks(
+                worker.model_runner,
+                key_bits=cfg["key_bits"],
+                value_bits=cfg["value_bits"],
+                buffer_size=cfg["buffer_size"],
+                initial_layers_count=cfg["initial_layers_count"],
+                mode=MODE_ACTIVE,
+                no_alloc=True,
+            )
+            return len(tq_states)
+
+        hooks = self.collective_rpc(_worker_install_tq)
+        logger.info(f"[TurboQuant] Installed hooks: {hooks} layers per worker")
+
+        return orig_get_specs(self)
+
+    Executor.get_kv_cache_specs = patched_get_kv_cache_specs
+    Executor._tq_patched = True
+    logger.info("[TurboQuant] Patched Executor for auto TQ hook installation")
+
+
+def free_kv_cache(model_runner):
+    """
+    Replace KV cache tensors for TQ-hooked layers with tiny 1-byte tensors.
+    Frees the GPU memory that was allocated for the standard paged KV cache.
+
+    Call this AFTER at least one prefill pass so TQ has compressed the KV data.
+    After this call, only TQ ACTIVE mode decode works (flash attention will fail).
+
+    Returns: bytes freed.
+    """
+    tq_states = getattr(model_runner, "_tq_states", None)
+    if not tq_states:
+        logger.warning("[TurboQuant] No TQ states found, nothing to free")
+        return 0
+
+    static_ctx = model_runner.compilation_config.static_forward_context
+    device = model_runner.device
+    freed = 0
+    tiny = torch.zeros(1, dtype=torch.int8, device=device)
+
+    # Build set of data_ptrs we need to free
+    ptrs_to_free = set()
+    for layer_name in tq_states:
+        if layer_name not in static_ctx:
+            continue
+        attn_module = static_ctx[layer_name]
+        kv_list = getattr(attn_module, "kv_cache", None)
+        if kv_list and len(kv_list) > 0:
+            ptrs_to_free.add(kv_list[0].data_ptr())
+
+    # Replace in forward_context
+    for layer_name in tq_states:
+        if layer_name not in static_ctx:
+            continue
+        attn_module = static_ctx[layer_name]
+        kv_list = getattr(attn_module, "kv_cache", None)
+        if kv_list and len(kv_list) > 0:
+            old = kv_list[0]
+            freed += old.nelement() * old.element_size()
+            kv_list[0] = tiny
+
+    # Replace in runner_kv_caches (entries may be tensors or [tensor] lists)
+    for i in range(len(model_runner.kv_caches)):
+        entry = model_runner.kv_caches[i]
+        if isinstance(entry, list):
+            for j in range(len(entry)):
+                if hasattr(entry[j], 'data_ptr') and entry[j].data_ptr() in ptrs_to_free:
+                    entry[j] = tiny
+        elif hasattr(entry, 'data_ptr') and entry.data_ptr() in ptrs_to_free:
+            model_runner.kv_caches[i] = tiny
+
+    torch.cuda.empty_cache()
+    logger.info(f"[TurboQuant] Freed {freed/1e6:.0f} MB KV cache ({len(tq_states)} layers)")
+    return freed
