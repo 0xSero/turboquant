@@ -782,17 +782,9 @@ def free_kv_cache(model_runner):
     freed = 0
     tiny = torch.zeros(1, dtype=torch.int8, device=device)
 
-    # Build set of data_ptrs we need to free
-    ptrs_to_free = set()
-    for layer_name in tq_states:
-        if layer_name not in static_ctx:
-            continue
-        attn_module = static_ctx[layer_name]
-        kv_list = getattr(attn_module, "kv_cache", None)
-        if kv_list and len(kv_list) > 0:
-            ptrs_to_free.add(kv_list[0].data_ptr())
-
-    # Replace in forward_context
+    # Only replace KV cache tensors for TQ-hooked layers.
+    # Other layers (e.g. linear/GDN attention in Qwen3.5) keep their caches.
+    hooked_ptrs = set()
     for layer_name in tq_states:
         if layer_name not in static_ctx:
             continue
@@ -800,17 +792,20 @@ def free_kv_cache(model_runner):
         kv_list = getattr(attn_module, "kv_cache", None)
         if kv_list and len(kv_list) > 0:
             old = kv_list[0]
-            freed += old.nelement() * old.element_size()
-            kv_list[0] = tiny
+            if old.numel() > 1:
+                hooked_ptrs.add(old.data_ptr())
+                freed += old.nelement() * old.element_size()
+                kv_list[0] = tiny
 
-    # Replace in runner_kv_caches (entries may be tensors or [tensor] lists)
+    # Also replace matching entries in runner_kv_caches, but ONLY for
+    # tensors that belong to hooked layers (identified by data_ptr).
     for i in range(len(model_runner.kv_caches)):
         entry = model_runner.kv_caches[i]
         if isinstance(entry, list):
             for j in range(len(entry)):
-                if hasattr(entry[j], 'data_ptr') and entry[j].data_ptr() in ptrs_to_free:
+                if hasattr(entry[j], 'data_ptr') and entry[j].data_ptr() in hooked_ptrs:
                     entry[j] = tiny
-        elif hasattr(entry, 'data_ptr') and entry.data_ptr() in ptrs_to_free:
+        elif hasattr(entry, 'data_ptr') and entry.data_ptr() in hooked_ptrs:
             model_runner.kv_caches[i] = tiny
 
     torch.cuda.empty_cache()
