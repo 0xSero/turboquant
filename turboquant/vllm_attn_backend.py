@@ -316,6 +316,18 @@ class PatchedFlashForward:
                 )
 
         # --- DECODE ---
+        # When paged KV cache exists, always use flash attention for decode.
+        # Flash attention reads from the complete paged cache (prefill + all
+        # decode tokens) and is faster than the TQ Triton kernel path.
+        # The TQ compressed store is only used for decode when no_alloc=True
+        # (i.e. the paged cache has been freed to save VRAM).
+        if not self.no_alloc:
+            return self.orig_fn(
+                self_impl, layer, query, key, value, kv_cache,
+                attn_metadata, output, output_scale, output_block_scale,
+            )
+
+        # no_alloc path: paged cache was freed, must use TQ decode
         cache = self.state.seq_caches.get("default")
         flat = self.state.get_flat_cache(cache) if cache is not None else None
         has_tq_data = flat is not None and flat[2] >= 16
@@ -339,26 +351,10 @@ class PatchedFlashForward:
                         self.state._log_count += 1
 
                     if output is not None:
-                        output.copy_(result)
+                        output.copy_(result.view_as(output))
                         return output
                     return result
 
-        # Fallback to flash attention (only works if paged cache was allocated)
-        if not self.no_alloc:
-            if not has_tq_data:
-                return self.orig_fn(
-                    self_impl, layer, query, key, value, kv_cache,
-                    attn_metadata, output, output_scale, output_block_scale,
-                )
-
-            # SHADOW mode
-            flash_out = self.orig_fn(
-                self_impl, layer, query, key, value, kv_cache,
-                attn_metadata, output, output_scale, output_block_scale,
-            )
-            return flash_out
-
-        # no_alloc decode without TQ data -- shouldn't happen after prefill
         logger.warning(f"[TQ] no_alloc decode without TQ data on L{self.state.layer_idx}")
         num_actual = attn_metadata.num_actual_tokens
         return torch.zeros(num_actual, query.shape[-1], dtype=query.dtype, device=query.device)
@@ -479,17 +475,12 @@ def _tq_prefill_attention(
     return result.to(query.dtype)
 
 
-def _repeat_kv_heads_for_gqa(query_heads: torch.Tensor, num_kv_heads: int) -> torch.Tensor:
-    num_tokens, num_query_heads, head_dim = query_heads.shape
-    if num_query_heads == num_kv_heads:
-        return query_heads
-    if num_query_heads % num_kv_heads != 0:
-        raise ValueError(
-            f"Unsupported GQA layout: query_heads={num_query_heads}, kv_heads={num_kv_heads}"
-        )
-    groups = num_query_heads // num_kv_heads
-    grouped = query_heads.view(num_tokens, num_kv_heads, groups, head_dim)
-    return grouped.reshape(num_tokens * groups * num_kv_heads, 1, head_dim)
+def _expand_cache_for_gqa(tensor: torch.Tensor, num_kv_heads: int, num_query_heads: int) -> torch.Tensor:
+    """Expand a (num_kv_heads, ...) cache tensor to (num_query_heads, ...) by repeating."""
+    if num_query_heads == num_kv_heads or tensor.shape[0] != num_kv_heads:
+        return tensor
+    repeats = num_query_heads // num_kv_heads
+    return tensor.repeat_interleave(repeats, dim=0)
 
 
 def _build_flash_decode_batch(
@@ -512,7 +503,27 @@ def _build_flash_decode_batch(
     flat_prod_q, flat_value_q, quantized_tokens = flat
 
     num_query_heads = q.shape[1]
-    flat_query = _repeat_kv_heads_for_gqa(q.contiguous(), state.num_kv_heads)
+    num_kv_heads = state.num_kv_heads
+
+    # Flatten query: (num_actual, num_query_heads, D) -> (num_query_heads, 1, D)
+    flat_query = q.squeeze(0).unsqueeze(1).contiguous()  # (num_query_heads, 1, D)
+
+    # For GQA: expand cache from num_kv_heads to num_query_heads by repeating
+    if num_query_heads != num_kv_heads:
+        exp = lambda t: _expand_cache_for_gqa(t, num_kv_heads, num_query_heads)
+        flat_prod_q = ProdQuantized(
+            mse_indices=exp(flat_prod_q.mse_indices),
+            qjl_signs=exp(flat_prod_q.qjl_signs),
+            norms=exp(flat_prod_q.norms),
+            residual_norms=exp(flat_prod_q.residual_norms),
+            mse_bits=flat_prod_q.mse_bits,
+        )
+        flat_value_q = ValueQuantized(
+            data=exp(flat_value_q.data),
+            scales=exp(flat_value_q.scales),
+            zeros=exp(flat_value_q.zeros),
+            bits=flat_value_q.bits,
+        )
 
     return DecodeBatch(
         query_heads=flat_query,
