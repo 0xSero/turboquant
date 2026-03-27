@@ -92,6 +92,14 @@ Multiple OOM crashes on 8x RTX 3090 (24GB each). The model is multimodal (vision
 - **Lossy compression**: TQ is lossy. 3-bit keys + 2-bit values lose information. Quality impact depends on the task and model.
 - **Single sequence tested**: The proof runs 1 sequence. Production benefits scale with concurrent requests.
 
+## Community Ports
+
+| Project | Hardware | Backend | Link |
+|---------|----------|---------|------|
+| **turboquant-mac** | Apple Silicon (M1–M4) | MLX Metal kernels + PyTorch CPU | [yzamari/turboQuantPlayground](https://github.com/yzamari/turboQuantPlayground) |
+| **turboquant-pytorch** | Any CPU/GPU | PyTorch | [tonbistudio/turboquant-pytorch](https://github.com/tonbistudio/turboquant-pytorch) |
+| **turbo-quant** | Any CPU | Rust | [RecursiveIntell/turbo-quant](https://github.com/RecursiveIntell/turbo-quant) |
+
 ## Environment
 
 - vLLM 0.17.0
