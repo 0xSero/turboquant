@@ -9,7 +9,19 @@ Usage:
 import os, sys, subprocess, json, time
 
 PYTHON = sys.executable
-GPUS = os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,4,6")
+
+
+def _default_gpu_ids() -> str:
+    """Auto-detect available GPUs, falling back to '0'."""
+    try:
+        import torch
+        n = torch.cuda.device_count()
+        return ",".join(str(i) for i in range(n)) if n > 0 else "0"
+    except Exception:
+        return "0"
+
+
+GPUS = os.environ.get("CUDA_VISIBLE_DEVICES") or _default_gpu_ids()
 
 MODELS = {
     "Qwen2.5-7B-Instruct": {
@@ -32,23 +44,27 @@ def run_script(name, code):
     path = f"/tmp/tq_{name}.py"
     with open(path, "w") as f:
         f.write(code)
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = GPUS
-    env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-    env["TOKENIZERS_PARALLELISM"] = "false"
-    r = subprocess.run([PYTHON, path], capture_output=True, text=True, env=env, timeout=600)
-    if r.returncode != 0:
-        print(f"  {name} FAILED")
-        for l in r.stderr.split("\n"):
-            if "Error" in l and "Warning" not in l and "Future" not in l:
-                print(f"    {l.strip()}")
+    try:
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = GPUS
+        env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        env["TOKENIZERS_PARALLELISM"] = "false"
+        r = subprocess.run([PYTHON, path], capture_output=True, text=True, env=env, timeout=600)
+        if r.returncode != 0:
+            print(f"  {name} FAILED")
+            for l in r.stderr.split("\n"):
+                if "Error" in l and "Warning" not in l and "Future" not in l:
+                    print(f"    {l.strip()}")
+            return None
+        for line in reversed(r.stdout.strip().split("\n")):
+            try:
+                return json.loads(line)
+            except:
+                pass
         return None
-    for line in reversed(r.stdout.strip().split("\n")):
-        try:
-            return json.loads(line)
-        except:
-            pass
-    return None
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
 
 
 def baseline_code(m):

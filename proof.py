@@ -7,11 +7,22 @@ Hard numbers side by side.
 """
 import os, sys, subprocess, json
 
+
+def _default_gpu_ids() -> str:
+    """Auto-detect available GPUs, falling back to '0'."""
+    try:
+        import torch
+        n = torch.cuda.device_count()
+        return ",".join(str(i) for i in range(n)) if n > 0 else "0"
+    except Exception:
+        return "0"
+
+
 MODEL = os.environ.get("MODEL", "Qwen/Qwen3.5-27B")
 TP = int(os.environ.get("TP", "4"))
 GPU_MEM = float(os.environ.get("GPU_MEM", "0.90"))
 MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "131072"))
-GPUS = os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,4,6")
+GPUS = os.environ.get("CUDA_VISIBLE_DEVICES") or _default_gpu_ids()
 PYTHON = sys.executable
 
 
@@ -19,24 +30,28 @@ def run_phase(name, script):
     path = f"/tmp/tq_{name}.py"
     with open(path, "w") as f:
         f.write(script)
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = GPUS
-    env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-    env["TOKENIZERS_PARALLELISM"] = "false"
-    r = subprocess.run([PYTHON, path], capture_output=True, text=True, env=env, timeout=600)
-    if r.returncode != 0:
-        print(f"=== {name} FAILED ===")
-        # Find the actual error
-        for line in r.stderr.split("\n"):
-            if "Error" in line or "error" in line:
-                print(f"  {line.strip()}")
+    try:
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = GPUS
+        env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        env["TOKENIZERS_PARALLELISM"] = "false"
+        r = subprocess.run([PYTHON, path], capture_output=True, text=True, env=env, timeout=600)
+        if r.returncode != 0:
+            print(f"=== {name} FAILED ===")
+            # Find the actual error
+            for line in r.stderr.split("\n"):
+                if "Error" in line or "error" in line:
+                    print(f"  {line.strip()}")
+            return None
+        for line in reversed(r.stdout.strip().split("\n")):
+            try:
+                return json.loads(line)
+            except:
+                continue
         return None
-    for line in reversed(r.stdout.strip().split("\n")):
-        try:
-            return json.loads(line)
-        except:
-            continue
-    return None
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
 
 
 BASELINE = f'''

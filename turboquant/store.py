@@ -117,14 +117,14 @@ class CompressedKVStore:
         """Estimate GPU memory used by compressed data."""
         total = 0
         for kq in self._key_chunks:
-            total += kq.mse_indices.nelement()
-            total += kq.qjl_signs.nelement()
-            total += kq.residual_norms.nelement() * 2
-            total += kq.norms.nelement() * 2
+            total += kq.mse_indices.nelement() * kq.mse_indices.element_size()
+            total += kq.qjl_signs.nelement() * kq.qjl_signs.element_size()
+            total += kq.residual_norms.nelement() * kq.residual_norms.element_size()
+            total += kq.norms.nelement() * kq.norms.element_size()
         for vq in self._value_chunks:
-            total += vq.data.nelement()
-            total += vq.scales.nelement() * 2
-            total += vq.zeros.nelement() * 2
+            total += vq.data.nelement() * vq.data.element_size()
+            total += vq.scales.nelement() * vq.scales.element_size()
+            total += vq.zeros.nelement() * vq.zeros.element_size()
         return total
 
     def reset(self):
