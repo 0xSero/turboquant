@@ -214,6 +214,7 @@ class KVCaptureEngine:
 
         all_k = torch.cat(keys_list, dim=0)  # (num_tokens, heads, dim)
         all_v = torch.cat(vals_list, dim=0)
+        print(f"Number of Base Key tokens under all blocks or pages are: {all_k.shape[0]}")
         self.ingest_prefill(all_k, all_v, num_tokens)
 
     def ingest_decode(self, key: torch.Tensor, value: torch.Tensor, num_tokens: int):
