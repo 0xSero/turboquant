@@ -168,20 +168,26 @@ class KVCaptureEngine:
         return self.total_compressed_tokens + self.total_buffered_tokens
 
     def ingest_prefill(self, key: torch.Tensor, value: torch.Tensor, num_tokens: int):
-        """Bulk-capture prefill KV into the store (bypasses ring buffer).
+        """Bulk-capture prefill KV; flush ring overflow to the store.
 
+        Mirrors ``ingest_decode`` so chunked-prefill overflow is never lost.
         key/value: (num_tokens, num_kv_heads, head_dim)
         """
         if num_tokens <= self.ring.capacity:
-            self.ring.write(key[:num_tokens], value[:num_tokens], num_tokens)
+            overflow = self.ring.write(
+                key[:num_tokens], value[:num_tokens], num_tokens
+            )
         else:
             n_compress = num_tokens - self.ring.capacity
             self.store.append_chunk(key[:n_compress], value[:n_compress])
-            self.ring.write(
+            overflow = self.ring.write(
                 key[n_compress:num_tokens],
                 value[n_compress:num_tokens],
                 self.ring.capacity,
             )
+        if overflow is not None:
+            k_over, v_over = overflow
+            self.store.append_chunk(k_over, v_over)
         self._prefill_done = True
 
     def ingest_prefill_from_paged_cache(
