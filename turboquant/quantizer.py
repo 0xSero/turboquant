@@ -19,6 +19,26 @@ from turboquant.rotation import (
 )
 
 
+# --- CUDA-graph-safe powers-of-two cache (added by turbokv patch) ---
+# `torch.tensor([1,2,...], device=X)` allocates on CPU then copies to GPU,
+# which breaks CUDA graph capture.  Cache per-device tensors instead.
+_POWERS_CACHE: dict[torch.device, torch.Tensor] = {}
+
+
+def _qjl_powers(device: torch.device) -> torch.Tensor:
+    cached = _POWERS_CACHE.get(device)
+    if cached is None:
+        cached = torch.tensor(
+            [1, 2, 4, 8, 16, 32, 64, 128],
+            dtype=torch.uint8,
+            pin_memory=False,
+        ).to(device)
+        _POWERS_CACHE[device] = cached
+    return cached
+# --- end cuda-graph-safe patch ---
+
+
+
 class MSEQuantized(NamedTuple):
     """Output of TurboQuant MSE quantization."""
     indices: torch.Tensor       # (..., packed_len) uint8 bit-packed indices
@@ -218,12 +238,12 @@ class TurboQuantProd(torch.nn.Module):
         if d % 8 != 0:
             signs = F.pad(signs, (0, 8 - d % 8), value=0)
         signs_reshaped = signs.reshape(*signs.shape[:-1], -1, 8)
-        powers = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], device=signs.device, dtype=torch.uint8)
+        powers = _qjl_powers(signs.device)
         return (signs_reshaped * powers).sum(dim=-1, dtype=torch.uint8)
 
     def _unpack_qjl_signs(self, packed: torch.Tensor) -> torch.Tensor:
         """Unpack sign bits from uint8 to float {-1, +1}."""
-        powers = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], device=packed.device, dtype=torch.uint8)
+        powers = _qjl_powers(packed.device)
         unpacked = ((packed.unsqueeze(-1) & powers) > 0).float()
         signs = unpacked.reshape(*packed.shape[:-1], -1)[..., :self.dim]
         return 2.0 * signs - 1.0
