@@ -472,7 +472,7 @@ def free_kv_cache(model_runner) -> int:
             continue
         attn_module = static_ctx[layer_name]
         kv_list = getattr(attn_module, "kv_cache", None)
-        if kv_list and len(kv_list) > 0:
+        if kv_list is not None and len(kv_list) > 0:
             ptrs_to_free.add(kv_list[0].data_ptr())
 
     for layer_name, state in layer_states.items():
@@ -482,7 +482,7 @@ def free_kv_cache(model_runner) -> int:
             continue
         attn_module = static_ctx[layer_name]
         kv_list = getattr(attn_module, "kv_cache", None)
-        if kv_list and len(kv_list) > 0:
+        if kv_list is not None and len(kv_list) > 0:
             old = kv_list[0]
             freed += old.nelement() * old.element_size()
             kv_list[0] = tiny
