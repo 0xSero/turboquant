@@ -114,9 +114,7 @@ def enable_no_alloc(
 
     def patched_get_kv_cache_specs(self):
         cfg = _TQ_NO_ALLOC_CONFIG
-        with open("/tmp/tq_debug.log", "a") as f:
-            f.write(f"patched_get_kv_cache_specs called pid={os.getpid()} cfg={cfg is not None}\n")
-            f.flush()
+        logger.debug("patched_get_kv_cache_specs called, cfg=%s", cfg is not None)
         if cfg is None:
             return orig_get_specs(self)
 
@@ -199,15 +197,9 @@ def enable_no_alloc(
                         mode=MODE_ACCUMULATE,
                         no_alloc=False,
                     )
-                    with open("/tmp/tq_debug.log", "a") as f:
-                        f.write(f"TQ hooks: {len(tq)} layers pid={os.getpid()}\n")
-                        f.flush()
+                    logger.debug("TQ hooks installed: %d layers", len(tq))
                 except Exception as e:
-                    with open("/tmp/tq_debug.log", "a") as f:
-                        import traceback
-                        f.write(f"TQ FAIL pid={os.getpid()}: {e}\n")
-                        traceback.print_exc(file=f)
-                        f.flush()
+                    logger.error("TQ hook installation failed: %s", e, exc_info=True)
 
         WorkerCls.load_model = patched_worker_load
 
