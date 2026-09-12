@@ -120,6 +120,39 @@ def _is_mla_impl(impl) -> bool:
     )
 
 
+def _is_prefill(attn_metadata) -> bool | None:
+    """Classify a forward batch as prefill (True) or decode (False).
+
+    Uses max_query_len when present (FlashAttention-style metadata).
+    Otherwise falls back to FlashInferMetadata's prefill/decode token
+    counts, which are plain Python ints — no tensor reads, no device sync.
+    Returns None when neither field family is present — callers must then
+    defer to the original backend instead of guessing the batch phase from
+    raw token counts.
+    """
+    max_query_len = getattr(attn_metadata, "max_query_len", None)
+    if max_query_len is not None:
+        return max_query_len > 1
+
+    prefill_tokens = getattr(attn_metadata, "num_prefill_tokens", None)
+    if prefill_tokens is None:
+        prefill_tokens = getattr(attn_metadata, "num_prefills", None)
+    if prefill_tokens is None:
+        return None
+    if prefill_tokens > 0:
+        # Mixed prefill+decode batches count as prefill, mirroring the
+        # max_query_len > 1 handling of mixed FlashAttention batches.
+        return True
+    decode_tokens = getattr(attn_metadata, "num_decode_tokens", None)
+    if decode_tokens is None:
+        decode_tokens = getattr(attn_metadata, "num_decodes", None)
+    if decode_tokens:
+        return False
+    # All counts 0: empty batch or cascade attention (both the prefill and
+    # decode sub-objects are None) — unclassifiable.
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Patched methods — kept as thin as possible
 # ---------------------------------------------------------------------------
@@ -155,7 +188,7 @@ def _no_alloc_prefill_attention(
     value: torch.Tensor,
     attn_metadata,
 ):
-    num_actual = attn_metadata.num_actual_tokens
+    num_actual = getattr(attn_metadata, 'num_actual_tokens', key.shape[0])
     q = query[:num_actual]
     k = key[:num_actual]
     v = value[:num_actual]
@@ -228,13 +261,20 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
                 attn_metadata, output, output_scale, output_block_scale,
             )
 
-        is_prefill = attn_metadata.max_query_len > 1
+        is_prefill = _is_prefill(attn_metadata)
+        if is_prefill is None:
+            # Unclassifiable metadata (no max_query_len / prefill-decode
+            # counts): defer to the original backend rather than guess.
+            return orig_fn(
+                self_impl, layer, query, key, value, kv_cache,
+                attn_metadata, output, output_scale, output_block_scale,
+            )
         if is_prefill:
             if no_alloc:
                 result = _no_alloc_prefill_attention(
                     state, self_impl, query, key, value, attn_metadata
                 )
-                num_actual = attn_metadata.num_actual_tokens
+                num_actual = getattr(attn_metadata, "num_actual_tokens", query.shape[0])
                 result_flat = result.reshape(
                     num_actual, state.config.num_query_heads * state.config.head_dim
                 ).to(query.dtype)
@@ -257,7 +297,7 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
         if mode == MODE_HYBRID and state.supports_hybrid:
             flat = state.store.get_flat_cache()
             if flat is not None and flat.num_tokens >= 16:
-                num_actual = attn_metadata.num_actual_tokens
+                num_actual = getattr(attn_metadata, "num_actual_tokens", query.shape[0])
                 q = query[:num_actual]
                 if q.dim() == 2:
                     q = q.view(num_actual, state.config.num_query_heads, state.config.head_dim)
