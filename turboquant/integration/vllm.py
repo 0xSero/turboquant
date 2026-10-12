@@ -292,15 +292,43 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
 
         # Fallback to flash
         if no_alloc:
+            # Short-history decode: the store is below the hybrid threshold but
+            # the ring may still hold exact tokens (a prompt within the ring
+            # capacity never leaves it). Attend over them via
+            # compute_hybrid_attention, which picks the exact-only path while
+            # the store is small — anything is better than returning zeros.
             num_actual = getattr(attn_metadata, "num_actual_tokens", query.shape[0])
-            if query.dim() == 3:
-                return torch.zeros_like(query[:num_actual])
-            return torch.zeros(
-                num_actual,
-                state.config.num_query_heads * state.config.head_dim,
-                dtype=query.dtype,
-                device=query.device,
+            q = query[:num_actual]
+            if q.dim() == 2:
+                q = q.view(num_actual, state.config.num_query_heads, state.config.head_dim)
+
+            recent = state.engine.ring.peek()
+            recent_k = recent[0] if recent else None
+            recent_v = recent[1] if recent else None
+
+            result = compute_hybrid_attention(
+                query=q,
+                store=state.store,
+                recent_k=recent_k,
+                recent_v=recent_v,
+                num_query_heads=state.config.num_query_heads,
+                scale=getattr(self_impl, "scale", None),
             )
+
+            result_flat = result.reshape(
+                num_actual, state.config.num_query_heads * state.config.head_dim
+            ).to(query.dtype)
+
+            if output is not None:
+                out_slice = output[:num_actual]
+                if out_slice.dim() == 3:
+                    out_slice.copy_(result.to(out_slice.dtype))
+                else:
+                    out_slice.copy_(result_flat.to(out_slice.dtype))
+                return output
+            if query.dim() == 3:
+                return result.to(query.dtype)
+            return result_flat
         return orig_fn(
             self_impl, layer, query, key, value, kv_cache,
             attn_metadata, output, output_scale, output_block_scale,
