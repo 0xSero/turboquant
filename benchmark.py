@@ -77,7 +77,7 @@ def main():
     from vllm import LLM, SamplingParams
     llm = LLM(model="{m['path']}", dtype="{m['dtype']}", gpu_memory_utilization={m['gpu_mem']},
         max_model_len={m['max_model_len']}, tensor_parallel_size={m['tp']},
-        trust_remote_code=True, max_num_seqs=1)
+        trust_remote_code=True, max_num_seqs=1, enforce_eager=True)
     blocks = llm.llm_engine.vllm_config.cache_config.num_gpu_blocks
 
     # Throughput
@@ -113,7 +113,7 @@ def main():
     from vllm import LLM, SamplingParams
     llm = LLM(model="{m['path']}", dtype="{m['dtype']}", gpu_memory_utilization={m['gpu_mem']},
         max_model_len={m['max_model_len']}, tensor_parallel_size={m['tp']},
-        trust_remote_code=True, max_num_seqs=1)
+        trust_remote_code=True, max_num_seqs=1, enforce_eager=True)
     blocks = llm.llm_engine.vllm_config.cache_config.num_gpu_blocks
 
     engine = llm.llm_engine
