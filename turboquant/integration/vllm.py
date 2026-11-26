@@ -103,9 +103,11 @@ def _create_layer_state(cfg: LayerConfig) -> LayerState:
 
 def _infer_num_query_heads(attn_module, impl) -> int:
     for candidate in (
+        getattr(impl, "num_query_heads", None),
+        getattr(impl, "num_heads", None),
+        getattr(attn_module, "num_query_heads", None),
         getattr(attn_module, "num_heads", None),
         getattr(attn_module, "num_attention_heads", None),
-        getattr(impl, "num_heads", None),
     ):
         if candidate:
             return int(candidate)
@@ -241,9 +243,9 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
                 if output is not None:
                     out_slice = output[:num_actual]
                     if out_slice.dim() == 3:
-                        out_slice.copy_(result.to(out_slice.dtype))
+                        out_slice.copy_(result.view_as(out_slice).to(out_slice.dtype))
                     else:
-                        out_slice.copy_(result_flat.to(out_slice.dtype))
+                        out_slice.copy_(result_flat.view_as(out_slice).to(out_slice.dtype))
                     return output
                 if query.dim() == 3:
                     return result.to(query.dtype)
@@ -282,9 +284,9 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
                 if output is not None:
                     out_slice = output[:num_actual]
                     if out_slice.dim() == 3:
-                        out_slice.copy_(result.to(out_slice.dtype))
+                        out_slice.copy_(result.view_as(out_slice).to(out_slice.dtype))
                     else:
-                        out_slice.copy_(result_flat.to(out_slice.dtype))
+                        out_slice.copy_(result_flat.view_as(out_slice).to(out_slice.dtype))
                     return output
                 if query.dim() == 3:
                     return result.to(query.dtype)
